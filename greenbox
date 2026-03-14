@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Resolve where greenbox itself is installed (for template access) ──
+GREENBOX_HOME="$(cd "$(dirname "$0")" && pwd)"
+
+# ── Helpers ──
+
+usage() {
+  cat <<'USAGE'
+Usage: greenbox <command> [options]
+
+Commands:
+  bootstrap [--standalone]    Add Dockerfile + .dockerignore to current directory
+  build [--dev] [<dir>]       Build Docker image
+  run [--dev] [<dir>]         Build and run container
+  stop [<name>]               Stop and remove container
+  list                        List greenbox containers
+  logs [<name>]               Tail container logs
+  setup-creds                 Set up ~/.claude_mine/ credential directory
+USAGE
+  exit 1
+}
+
+read_config() {
+  local dir="$1"
+  local config="$dir/.greenbox"
+  if [ ! -f "$config" ]; then
+    echo "Error: .greenbox not found in $dir"
+    echo "Run: greenbox bootstrap"
+    exit 1
+  fi
+  GB_NAME=$(grep '^name=' "$config" | cut -d= -f2)
+  GB_PORT=$(grep '^port=' "$config" | cut -d= -f2)
+  GB_PORT="${GB_PORT:-3100}"
+  if [ -z "$GB_NAME" ]; then
+    echo "Error: 'name' not set in $config"
+    exit 1
+  fi
+}
+
+resolve_dir() {
+  local dir="${1:-$(pwd)}"
+  if [ ! -d "$dir" ]; then
+    echo "Error: $dir is not a directory"
+    exit 1
+  fi
+  echo "$(cd "$dir" && pwd)"
+}
+
+# ── Commands ──
+
+copy_template() {
+  local src="$1" dest="$2"
+  if [ -f "$dest" ]; then
+    echo "  Skipped $dest (already exists)"
+    return
+  fi
+  cp "$src" "$dest"
+  echo "  Created $dest"
+}
+
+cmd_bootstrap() {
+  local standalone=false
+  if [ "${1:-}" = "--standalone" ]; then
+    standalone=true
+  fi
+
+  local default_name
+  default_name=$(basename "$(pwd)")
+
+  printf "Project name (%s): " "$default_name"
+  read -r input_name
+  local name="${input_name:-$default_name}"
+
+  printf "Port (3100): "
+  read -r input_port
+  local port="${input_port:-3100}"
+
+  echo ""
+
+  # Dockerfile and .dockerignore — straight copy
+  copy_template "$GREENBOX_HOME/template/Dockerfile" "Dockerfile"
+  copy_template "$GREENBOX_HOME/template/.dockerignore" ".dockerignore"
+
+  # .greenbox config
+  if [ -f ".greenbox" ]; then
+    echo "  Skipped .greenbox (already exists)"
+  else
+    printf "name=%s\nport=%s\n" "$name" "$port" > .greenbox
+    echo "  Created .greenbox"
+  fi
+
+  # .gitignore — append data/ if needed
+  if [ -f ".gitignore" ]; then
+    if ! grep -qx 'data/' .gitignore; then
+      echo 'data/' >> .gitignore
+      echo "  Appended data/ to .gitignore"
+    fi
+  else
+    echo 'data/' > .gitignore
+    echo "  Created .gitignore"
+  fi
+
+  # Standalone scripts
+  if [ "$standalone" = true ]; then
+    if [ -f "build.sh" ]; then
+      echo "  Skipped build.sh (already exists)"
+    else
+      cp "$GREENBOX_HOME/template/build.sh" build.sh
+      chmod +x build.sh
+      echo "  Created build.sh"
+    fi
+
+    if [ -f "run.sh" ]; then
+      echo "  Skipped run.sh (already exists)"
+    else
+      cp "$GREENBOX_HOME/template/run.sh" run.sh
+      chmod +x run.sh
+      echo "  Created run.sh"
+    fi
+  fi
+
+  echo ""
+  echo "Done. Run 'greenbox run --dev .' to start."
+}
+
+cmd_build() {
+  local dev=false
+  local dir=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dev) dev=true ;;
+      *)     dir="$1" ;;
+    esac
+    shift
+  done
+
+  dir=$(resolve_dir "$dir")
+  read_config "$dir"
+
+  if [ "$dev" = true ]; then
+    docker build --target dev -t "greenbox-${GB_NAME}:dev" "$dir"
+  else
+    docker build --target prod -t "greenbox-${GB_NAME}:latest" "$dir"
+  fi
+}
+
+cmd_run() {
+  local dev=false
+  local dir=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dev) dev=true ;;
+      *)     dir="$1" ;;
+    esac
+    shift
+  done
+
+  dir=$(resolve_dir "$dir")
+  read_config "$dir"
+
+  local container_name="greenbox-${GB_NAME}"
+
+  # Verify credentials
+  local creds="$HOME/.claude_mine/.credentials.json"
+  if [ ! -f "$creds" ]; then
+    echo "Error: $creds not found."
+    echo "Run: greenbox setup-creds"
+    exit 1
+  fi
+
+  # Create data dir
+  mkdir -p "$dir/data"
+
+  # Find free port
+  local port="$GB_PORT"
+  local max_port=$((GB_PORT + 20))
+  while lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1; do
+    ((port++))
+    if [ "$port" -gt "$max_port" ]; then
+      echo "Error: no free port in range ${GB_PORT}-${max_port}"
+      exit 1
+    fi
+  done
+
+  # Build
+  if [ "$dev" = true ]; then
+    cmd_build --dev "$dir"
+  else
+    cmd_build "$dir"
+  fi
+
+  # Stop existing
+  docker rm -f "$container_name" 2>/dev/null || true
+
+  # Env file
+  local env_args=()
+  if [ -f "$dir/.env" ]; then
+    env_args=(--env-file "$dir/.env")
+  fi
+
+  # Run
+  if [ "$dev" = true ]; then
+    docker run -d \
+      --name "$container_name" \
+      -p "$port:$GB_PORT" \
+      "${env_args[@]+"${env_args[@]}"}" \
+      -v "$creds:/home/node/.claude/.credentials.json:ro" \
+      -v "$dir:/app" \
+      -v "greenbox-${GB_NAME}-node_modules:/app/node_modules" \
+      -v "$dir/data:/app/data" \
+      "greenbox-${GB_NAME}:dev"
+  else
+    docker run -d \
+      --name "$container_name" \
+      -p "$port:$GB_PORT" \
+      "${env_args[@]+"${env_args[@]}"}" \
+      -v "$creds:/home/node/.claude/.credentials.json:ro" \
+      -v "$dir/data:/app/data" \
+      "greenbox-${GB_NAME}:latest"
+  fi
+
+  echo ""
+  echo "Running at http://localhost:$port"
+  if [ "$dev" = true ]; then
+    echo "Mode: dev (live reload)"
+  fi
+  echo "Logs: docker logs -f $container_name"
+}
+
+cmd_stop() {
+  local name="${1:-}"
+
+  if [ -z "$name" ]; then
+    read_config "$(pwd)"
+    name="$GB_NAME"
+  fi
+
+  local container_name="greenbox-${name}"
+  docker rm -f "$container_name" 2>/dev/null || true
+  echo "Stopped $container_name"
+}
+
+cmd_list() {
+  docker ps -a \
+    --filter "name=greenbox-" \
+    --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+}
+
+cmd_logs() {
+  local name="${1:-}"
+
+  if [ -z "$name" ]; then
+    read_config "$(pwd)"
+    name="$GB_NAME"
+  fi
+
+  docker logs -f "greenbox-${name}"
+}
+
+cmd_setup_creds() {
+  local dir="$HOME/.claude_mine"
+  local file="$dir/.credentials.json"
+
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+
+  if [ ! -f "$file" ]; then
+    touch "$file"
+    chmod 600 "$file"
+    echo "Created $file — paste your credentials into it."
+  else
+    chmod 600 "$file"
+    echo "$file already exists."
+  fi
+}
+
+# ── Command dispatch ──
+
+COMMAND="${1:-}"
+shift 2>/dev/null || true
+
+case "$COMMAND" in
+  bootstrap)   cmd_bootstrap "$@" ;;
+  build)       cmd_build "$@" ;;
+  run)         cmd_run "$@" ;;
+  stop)        cmd_stop "$@" ;;
+  list)        cmd_list "$@" ;;
+  logs)        cmd_logs "$@" ;;
+  setup-creds) cmd_setup_creds "$@" ;;
+  *)           usage ;;
+esac
