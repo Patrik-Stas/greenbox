@@ -82,4 +82,6 @@ echo "Running at http://localhost:$PORT"
 if [ "$DEV" = true ]; then
   echo "Mode: dev (live reload)"
 fi
-echo "Logs: docker logs -f $CONTAINER_NAME"
+echo ""
+
+docker logs -f "$CONTAINER_NAME"

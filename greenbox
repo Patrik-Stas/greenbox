@@ -228,7 +228,9 @@ cmd_run() {
   if [ "$dev" = true ]; then
     echo "Mode: dev (live reload)"
   fi
-  echo "Logs: docker logs -f $container_name"
+  echo ""
+
+  docker logs -f "$container_name"
 }
 
 cmd_stop() {
