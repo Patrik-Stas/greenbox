@@ -12,12 +12,12 @@ Usage: greenbox <command> [options]
 
 Commands:
   bootstrap [--standalone]    Add Dockerfile + .dockerignore to current directory
-  build [--dev] [<dir>]       Build Docker image
-  run [--dev] [<dir>]         Build and run container
+  build [--dev] [--no-cache] [<dir>]  Build Docker image
+  run [--dev] [--no-cache] [<dir>]    Build and run container
   stop [<name>]               Stop and remove container
   list                        List greenbox containers
   logs [<name>]               Tail container logs
-  setup-creds                 Set up ~/.claude_mine/ credential directory
+  setup-creds [<container>]    Set up credentials (extract from container if given)
 USAGE
   exit 1
 }
@@ -127,11 +127,13 @@ cmd_bootstrap() {
 
 cmd_build() {
   local dev=false
+  local no_cache=false
   local dir=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --dev) dev=true ;;
+      --no-cache) no_cache=true ;;
       *)     dir="$1" ;;
     esac
     shift
@@ -140,20 +142,27 @@ cmd_build() {
   dir=$(resolve_dir "$dir")
   read_config "$dir"
 
+  local cache_flag=""
+  if [ "$no_cache" = true ]; then
+    cache_flag="--no-cache"
+  fi
+
   if [ "$dev" = true ]; then
-    docker build --target dev -t "greenbox-${GB_NAME}:dev" "$dir"
+    docker build $cache_flag --target dev -t "greenbox-${GB_NAME}:dev" "$dir"
   else
-    docker build --target prod -t "greenbox-${GB_NAME}:latest" "$dir"
+    docker build $cache_flag --target prod -t "greenbox-${GB_NAME}:latest" "$dir"
   fi
 }
 
 cmd_run() {
   local dev=false
+  local no_cache=false
   local dir=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --dev) dev=true ;;
+      --no-cache) no_cache=true ;;
       *)     dir="$1" ;;
     esac
     shift
@@ -187,14 +196,22 @@ cmd_run() {
   done
 
   # Build
+  local build_args=()
   if [ "$dev" = true ]; then
-    cmd_build --dev "$dir"
-  else
-    cmd_build "$dir"
+    build_args+=(--dev)
   fi
+  if [ "$no_cache" = true ]; then
+    build_args+=(--no-cache)
+  fi
+  cmd_build "${build_args[@]+"${build_args[@]}"}" "$dir"
 
   # Stop existing
   docker rm -f "$container_name" 2>/dev/null || true
+
+  # Remove stale node_modules volume on rebuild
+  if [ "$no_cache" = true ]; then
+    docker volume rm "greenbox-${GB_NAME}-node_modules" 2>/dev/null || true
+  fi
 
   # Env file
   local env_args=()
@@ -264,19 +281,34 @@ cmd_logs() {
 }
 
 cmd_setup_creds() {
+  local container="${1:-}"
   local dir="$HOME/.claude_mine"
   local file="$dir/.credentials.json"
 
   mkdir -p "$dir"
   chmod 700 "$dir"
 
-  if [ ! -f "$file" ]; then
-    touch "$file"
+  if [ -n "$container" ]; then
+    # Extract credentials from a running container
+    local creds
+    # Try common credential locations
+    creds=$(docker exec "$container" cat /home/dev/.claude/.credentials.json 2>/dev/null) \
+      || creds=$(docker exec "$container" cat /home/node/.claude/.credentials.json 2>/dev/null) \
+      || creds=$(docker exec "$container" cat /root/.claude/.credentials.json 2>/dev/null) \
+      || { echo "Error: could not find .credentials.json in container $container"; exit 1; }
+
+    echo "$creds" > "$file"
     chmod 600 "$file"
-    echo "Created $file — paste your credentials into it."
+    echo "Extracted credentials from container $container → $file"
   else
-    chmod 600 "$file"
-    echo "$file already exists."
+    if [ ! -f "$file" ]; then
+      touch "$file"
+      chmod 600 "$file"
+      echo "Created $file — paste your credentials into it."
+    else
+      chmod 600 "$file"
+      echo "$file already exists."
+    fi
   fi
 }
 

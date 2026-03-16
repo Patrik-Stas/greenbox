@@ -13,10 +13,14 @@ CONFIGURED_PORT="${CONFIGURED_PORT:-3100}"
 
 CONTAINER_NAME="greenbox-${NAME}"
 DEV=false
+NO_CACHE=false
 
-if [ "${1:-}" = "--dev" ]; then
-  DEV=true
-fi
+for arg in "$@"; do
+  case "$arg" in
+    --dev)   DEV=true ;;
+    --no-cache) NO_CACHE=true ;;
+  esac
+done
 
 # Verify Claude credentials
 CLAUDE_CREDS="$HOME/.claude_mine/.credentials.json"
@@ -41,14 +45,24 @@ while lsof -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1; do
 done
 
 # Build
+CACHE_FLAG=""
+if [ "$NO_CACHE" = true ]; then
+  CACHE_FLAG="--no-cache"
+fi
+
 if [ "$DEV" = true ]; then
-  docker build --target dev -t "greenbox-${NAME}:dev" .
+  docker build $CACHE_FLAG --target dev -t "greenbox-${NAME}:dev" .
 else
-  docker build --target prod -t "greenbox-${NAME}:latest" .
+  docker build $CACHE_FLAG --target prod -t "greenbox-${NAME}:latest" .
 fi
 
 # Stop existing container if running
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+# Remove stale node_modules volume on rebuild
+if [ "$NO_CACHE" = true ]; then
+  docker volume rm "greenbox-${NAME}-node_modules" 2>/dev/null || true
+fi
 
 # Env file
 ENV_ARGS=()
